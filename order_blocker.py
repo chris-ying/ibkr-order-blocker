@@ -19,8 +19,9 @@ BLOCKED_WEEKDAY = 1
 BLOCK_END_TIME = clock_time(14, 0)
 
 ALL_ORDERS_BLOCK_WINDOWS = (
-    (clock_time(10, 50), clock_time(11, 0)),
-    (clock_time(11, 50), clock_time(12, 0)),
+    (clock_time(10, 50), clock_time(10, 59)),
+    (clock_time(11, 30), clock_time(11, 59)),
+    (clock_time(22, 30), clock_time(23, 40)),
 )
 
 MAX_SHORT_POSITION_VALUE = 6000
