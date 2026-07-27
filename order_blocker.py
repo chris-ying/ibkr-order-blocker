@@ -19,6 +19,7 @@ BLOCKED_WEEKDAY = 1
 BLOCK_END_TIME = clock_time(14, 0)
 
 ALL_ORDERS_BLOCK_WINDOWS = (
+    (clock_time(9, 30), clock_time(9, 39)),
     (clock_time(10, 50), clock_time(10, 59)),
     (clock_time(11, 30), clock_time(11, 59)),
     (clock_time(22, 30), clock_time(23, 40)),
@@ -31,7 +32,7 @@ MAX_SINGLE_ORDER_VALUE = 6000
 SAME_SIDE_FILLED_COOLDOWN_SECONDS = 10 * 60
 
 
-class SellOrderBlocker(EWrapper, EClient):
+class OrderBlocker(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
 
@@ -449,12 +450,12 @@ class SellOrderBlocker(EWrapper, EClient):
         )
 
 
-def api_loop(app: SellOrderBlocker):
+def api_loop(app: OrderBlocker):
     app.run()
 
 
 def main():
-    app = SellOrderBlocker()
+    app = OrderBlocker()
 
     print(f"Connecting to TWS at {HOST}:{PORT}...")
 
