@@ -14,12 +14,11 @@ CLIENT_ID = 0
 
 TIMEZONE = ZoneInfo("America/Toronto")
 
-
 BLOCKED_WEEKDAY = 1
 BLOCK_END_TIME = clock_time(14, 0)
 
 ALL_ORDERS_BLOCK_WINDOWS = (
-    (clock_time(9, 30), clock_time(9, 39)),
+    (clock_time(9, 20), clock_time(9, 39)),
     (clock_time(10, 50), clock_time(10, 59)),
     (clock_time(11, 30), clock_time(11, 59)),
     (clock_time(22, 30), clock_time(23, 40)),
@@ -63,7 +62,6 @@ class OrderBlocker(EWrapper, EClient):
         self.reqPositions()
         self.reqAutoOpenOrders(True)
         self.reqOpenOrders()
-
         self.ready.set()
 
     def position(self, account, contract, position, avg_cost):
@@ -372,20 +370,6 @@ class OrderBlocker(EWrapper, EClient):
         why_held,
         mkt_cap_price=0,
     ):
-        important_statuses = {
-            "PendingCancel",
-            "Cancelled",
-            "ApiCancelled",
-            "Filled",
-            "Inactive",
-        }
-
-        if status in important_statuses:
-            print(
-                f"Order status: "
-                f"ID={order_id}, "
-                f"status={status}"
-            )
 
         normalized_status = str(status).strip().lower()
         remaining_quantity = float(remaining)
