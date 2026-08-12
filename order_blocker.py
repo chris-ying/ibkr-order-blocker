@@ -1,4 +1,7 @@
+import json
 import time
+import signal
+from pathlib import Path
 from datetime import datetime, time as clock_time
 from threading import Event, Thread
 from zoneinfo import ZoneInfo
@@ -15,17 +18,23 @@ CLIENT_ID = 0
 TIMEZONE = ZoneInfo("America/Toronto")
 
 BLOCKED_WEEKDAY = 1
-BLOCK_END_TIME = clock_time(14, 0)
+BLOCK_END_TIME = clock_time(10, 0)
+
+# Block all BUY and SELL orders during IBKR overnight trading hours.
+OVERNIGHT_BLOCK_START = clock_time(20, 0)
+OVERNIGHT_BLOCK_END = clock_time(4, 0)
 
 ALL_ORDERS_BLOCK_WINDOWS = (
-    (clock_time(9, 20), clock_time(9, 39)),
+    (clock_time(9, 29), clock_time(9, 39)),
     (clock_time(10, 50), clock_time(10, 59)),
     (clock_time(11, 30), clock_time(11, 59)),
-    (clock_time(22, 30), clock_time(23, 40)),
 )
 
 MAX_SHORT_POSITION_VALUE = 6000
 MAX_SINGLE_ORDER_VALUE = 6000
+MAX_BUY_FILLS_PER_DAY = 3
+MAX_SELL_FILLS_PER_DAY = 3
+FILLED_COUNT_FILE = Path(__file__).with_name("daily_filled_counts.json")
 
 # The cooldown starts only after an order is completely filled.
 SAME_SIDE_FILLED_COOLDOWN_SECONDS = 10 * 60
@@ -49,11 +58,119 @@ class OrderBlocker(EWrapper, EClient):
         self.position_accounts = {}
 
         self.active_sell_orders = {}
+        self.active_stock_orders = {}
 
         self.order_details = {}
 
-
         self.last_completed_order_times = {}
+
+        self.daily_filled_counts = {}
+        self.daily_filled_count_date = datetime.now(TIMEZONE).date()
+        self.load_daily_filled_counts()
+
+    def load_daily_filled_counts(self):
+        try:
+            if not FILLED_COUNT_FILE.exists():
+                return
+
+            data = json.loads(FILLED_COUNT_FILE.read_text())
+            saved_date = data.get("date")
+            today = str(datetime.now(TIMEZONE).date())
+
+            if saved_date != today:
+                return
+
+            for item in data.get("counts", []):
+                con_id = int(item["conId"])
+                action = str(item["action"]).upper()
+                count = int(item["count"])
+                self.daily_filled_counts[(con_id, action)] = count
+
+            if self.daily_filled_counts:
+                print("Restored today's completed BUY/SELL fill counts.")
+        except Exception as exc:
+            print(f"Could not load filled-count file: {exc}")
+
+    def save_daily_filled_counts(self):
+        try:
+            counts = [
+                {"conId": con_id, "action": action, "count": count}
+                for (con_id, action), count in self.daily_filled_counts.items()
+            ]
+            data = {
+                "date": str(self.daily_filled_count_date),
+                "counts": counts,
+            }
+            FILLED_COUNT_FILE.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            print(f"Could not save filled-count file: {exc}")
+
+    def reset_daily_filled_counts_if_needed(self):
+        today = datetime.now(TIMEZONE).date()
+
+        if today != self.daily_filled_count_date:
+            self.daily_filled_counts.clear()
+            self.daily_filled_count_date = today
+            self.save_daily_filled_counts()
+            print(f"Daily completed BUY/SELL fill counts reset: {today}")
+
+    def daily_filled_limit_reached(self, con_id, symbol, action):
+        if action not in {"BUY", "SELL"}:
+            return False
+
+        self.reset_daily_filled_counts_if_needed()
+
+        key = (con_id, action)
+        current_count = self.daily_filled_counts.get(key, 0)
+        maximum = (
+            MAX_BUY_FILLS_PER_DAY
+            if action == "BUY"
+            else MAX_SELL_FILLS_PER_DAY
+        )
+
+        if current_count >= maximum:
+            print(
+                f"Daily completed-fill limit reached: "
+                f"{symbol} already has {current_count}/{maximum} "
+                f"filled {action} orders today. Cancelling the new order."
+            )
+            return True
+
+        return False
+
+    def record_daily_completed_fill(self, con_id, symbol, action):
+        if action not in {"BUY", "SELL"}:
+            return
+
+        self.reset_daily_filled_counts_if_needed()
+
+        key = (con_id, action)
+        self.daily_filled_counts[key] = self.daily_filled_counts.get(key, 0) + 1
+
+        maximum = (
+            MAX_BUY_FILLS_PER_DAY
+            if action == "BUY"
+            else MAX_SELL_FILLS_PER_DAY
+        )
+
+        self.save_daily_filled_counts()
+
+        print(
+            f"Daily completed-fill count: {symbol} {action} "
+            f"{self.daily_filled_counts[key]}/{maximum}."
+        )
+
+        if self.daily_filled_counts[key] >= maximum:
+            for pending_order_id, pending in list(self.active_stock_orders.items()):
+                if (
+                    pending["conId"] == con_id
+                    and pending["action"] == action
+                ):
+                    print(
+                        f"Daily {action} fill limit is now reached for {symbol}. "
+                        f"Cancelling pending order {pending_order_id}."
+                    )
+                    self.request_cancel(pending_order_id)
 
     def nextValidId(self, order_id: int):
         print("Connected to TWS.")
@@ -138,6 +255,18 @@ class OrderBlocker(EWrapper, EClient):
                 "quantity": quantity,
             }
 
+        if (
+            security_type == "STK"
+            and action in {"BUY", "SELL"}
+            and order_id != 0
+            and status in {"PreSubmitted", "Submitted"}
+        ):
+            self.active_stock_orders[order_id] = {
+                "conId": con_id,
+                "symbol": symbol,
+                "action": action,
+            }
+
         if not self.initial_orders_loaded:
             if order_id != 0:
                 self.initial_order_ids.add(order_id)
@@ -166,8 +295,28 @@ class OrderBlocker(EWrapper, EClient):
             print(
                 f"Time restriction triggered. "
                 f"Cancelling new {action} order {order_id} "
-                f"for {symbol}. All new orders are blocked "
-                f"from 10:50 AM to 10:59 AM & from 11:50 AM to 11:59 AM."
+                f"for {symbol}."
+            )
+
+            self.request_cancel(order_id)
+            return
+
+        should_cancel_overnight_order = (
+            security_type == "STK"
+            and action in {"BUY", "SELL"}
+            and (
+                now.time() >= OVERNIGHT_BLOCK_START
+                or now.time() < OVERNIGHT_BLOCK_END
+            )
+        )
+
+        if should_cancel_overnight_order:
+            print(
+                f"Overnight trading restriction triggered. "
+                f"Cancelling {action} order {order_id} for {symbol}. "
+                f"Stock BUY and SELL orders are blocked from "
+                f"{OVERNIGHT_BLOCK_START.strftime('%H:%M')} to "
+                f"{OVERNIGHT_BLOCK_END.strftime('%H:%M')} "
             )
 
             self.request_cancel(order_id)
@@ -255,6 +404,11 @@ class OrderBlocker(EWrapper, EClient):
                 self.request_cancel(order_id)
                 return
 
+        if security_type == "STK" and action in {"BUY", "SELL"}:
+            if self.daily_filled_limit_reached(con_id, symbol, action):
+                self.request_cancel(order_id)
+                return
+
         if security_type == "STK" and action == "SELL":
             if not self.positions_loaded:
                 print(
@@ -332,7 +486,6 @@ class OrderBlocker(EWrapper, EClient):
 
         print(
             f"{symbol} {action} order {order_id} allowed. "
-            "The cooldown will start only after the order is fully filled."
         )
 
     def request_cancel(self, order_id):
@@ -387,10 +540,14 @@ class OrderBlocker(EWrapper, EClient):
                 con_id = details["conId"]
                 symbol = details["symbol"]
                 action = details["action"]
+                security_type = details["securityType"]
                 rule_key = (con_id, action)
 
                 self.last_completed_order_times[rule_key] = time.monotonic()
                 details["completedRecorded"] = True
+
+                if security_type == "STK" and action in {"BUY", "SELL"}:
+                    self.record_daily_completed_fill(con_id, symbol, action)
 
                 print(
                     f"Cooldown started: {symbol} {action} order "
@@ -404,6 +561,7 @@ class OrderBlocker(EWrapper, EClient):
             "filled",
         }:
             self.active_sell_orders.pop(order_id, None)
+            self.active_stock_orders.pop(order_id, None)
             self.cancel_requested.discard(order_id)
 
     def connectionClosed(self):
@@ -432,6 +590,16 @@ class OrderBlocker(EWrapper, EClient):
             f"code={error_code}, "
             f"message={error_string}"
         )
+
+def confirm_exit(signum, frame):
+    print()
+    print("Ctrl+C detected.")
+    confirmation = input('Type "FOLLOW YOUR RULES" to stop the order blocker: ')
+
+    if confirmation.strip() == "FOLLOW YOUR RULES":
+        raise KeyboardInterrupt
+
+    print("Incorrect phrase. Order blocker will continue running.")
 
 
 def api_loop(app: OrderBlocker):
@@ -466,7 +634,11 @@ def main():
 
     print()
     print("Order blocker is running.")
-    print("Tuesday SELL orders are blocked before 2:00 PM.")
+    print("Tuesday SELL orders are blocked before 10:00 AM.")
+    print(
+        "Stock BUY and SELL orders are blocked overnight from "
+        "8:00 PM to 4:00 AM Toronto time."
+    )
     print(
         f"Maximum single stock order value: "
         f"${MAX_SINGLE_ORDER_VALUE:.2f}."
@@ -479,21 +651,28 @@ def main():
         "After an order is fully filled, another order for the "
         "same ticker and same side is blocked for 10 minutes."
     )
+    print(
+        f"Maximum completed fills per ticker per day: "
+        f"{MAX_BUY_FILLS_PER_DAY} BUY fills and "
+        f"{MAX_SELL_FILLS_PER_DAY} SELL fills."
+    )
     print("Press Control+C to stop.")
     print()
+
+    signal.signal(signal.SIGINT, confirm_exit)
 
     try:
         while app.isConnected():
             time.sleep(1)
 
     except KeyboardInterrupt:
-        print("\nStopping the order controller...")
+        print("\nStopping the order blocker...")
 
     finally:
         if app.isConnected():
             app.disconnect()
 
-        print("Order controller stopped.")
+        print("Order blocker stopped.")
 
 
 if __name__ == "__main__":

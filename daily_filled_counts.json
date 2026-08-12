@@ -1,0 +1,30 @@
+{
+  "date": "2026-08-11",
+  "counts": [
+    {
+      "conId": 483492393,
+      "action": "BUY",
+      "count": 3
+    },
+    {
+      "conId": 483492393,
+      "action": "SELL",
+      "count": 1
+    },
+    {
+      "conId": 201113895,
+      "action": "BUY",
+      "count": 1
+    },
+    {
+      "conId": 870556708,
+      "action": "SELL",
+      "count": 3
+    },
+    {
+      "conId": 88819736,
+      "action": "SELL",
+      "count": 1
+    }
+  ]
+}
