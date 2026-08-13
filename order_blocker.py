@@ -20,14 +20,16 @@ TIMEZONE = ZoneInfo("America/Toronto")
 BLOCKED_WEEKDAY = 1
 BLOCK_END_TIME = clock_time(10, 0)
 
+MARKET_OPEN_SELL_BLOCK_START = clock_time(9, 30)
+MARKET_OPEN_SELL_BLOCK_END = clock_time(9, 40)
+
 # Block all BUY and SELL orders during IBKR overnight trading hours.
 OVERNIGHT_BLOCK_START = clock_time(20, 0)
 OVERNIGHT_BLOCK_END = clock_time(4, 0)
 
 ALL_ORDERS_BLOCK_WINDOWS = (
-    (clock_time(9, 29), clock_time(9, 39)),
     (clock_time(10, 50), clock_time(10, 59)),
-    (clock_time(11, 30), clock_time(11, 59)),
+    (clock_time(11, 50), clock_time(11, 59)),
 )
 
 MAX_SHORT_POSITION_VALUE = 6000
@@ -337,6 +339,24 @@ class OrderBlocker(EWrapper, EClient):
             self.request_cancel(order_id)
             return
 
+        should_cancel_market_open_sell = (
+            security_type == "STK"
+            and action == "SELL"
+            and MARKET_OPEN_SELL_BLOCK_START <= now.time() < MARKET_OPEN_SELL_BLOCK_END
+        )
+
+        if should_cancel_market_open_sell:
+            print(
+                f"Market-open SELL restriction triggered. "
+                f"Cancelling SELL order {order_id} for {symbol}. "
+                f"New stock SELL orders are blocked from "
+                f"{MARKET_OPEN_SELL_BLOCK_START.strftime('%H:%M')} to "
+                f"{MARKET_OPEN_SELL_BLOCK_END.strftime('%H:%M')} Toronto time."
+            )
+
+            self.request_cancel(order_id)
+            return
+
         if security_type == "STK":
             if order_type not in {"LMT", "STP LMT"}:
                 print(
@@ -594,9 +614,9 @@ class OrderBlocker(EWrapper, EClient):
 def confirm_exit(signum, frame):
     print()
     print("Ctrl+C detected.")
-    confirmation = input('Type "FOLLOW YOUR RULES" to stop the order blocker: ')
+    confirmation = input('Type "THINK ABOUT NBIS" to stop the order blocker: ')
 
-    if confirmation.strip() == "FOLLOW YOUR RULES":
+    if confirmation.strip() == "THINK ABOUT NBIS":
         raise KeyboardInterrupt
 
     print("Incorrect phrase. Order blocker will continue running.")
@@ -635,6 +655,7 @@ def main():
     print()
     print("Order blocker is running.")
     print("Tuesday SELL orders are blocked before 10:00 AM.")
+    print("New stock SELL orders are blocked from 9:30 AM to 9:40 AM Toronto time.")
     print(
         "Stock BUY and SELL orders are blocked overnight from "
         "8:00 PM to 4:00 AM Toronto time."
