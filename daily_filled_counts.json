@@ -24,11 +24,21 @@
     {
       "conId": 88819736,
       "action": "BUY",
-      "count": 1
+      "count": 3
     },
     {
       "conId": 870556708,
       "action": "SELL",
+      "count": 1
+    },
+    {
+      "conId": 483492393,
+      "action": "BUY",
+      "count": 1
+    },
+    {
+      "conId": 870556708,
+      "action": "BUY",
       "count": 1
     }
   ]

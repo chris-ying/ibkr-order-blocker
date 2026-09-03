@@ -1,6 +1,7 @@
 import json
 import time
 import signal
+import subprocess
 from pathlib import Path
 from datetime import datetime, time as clock_time
 from threading import Event, Thread
@@ -17,29 +18,67 @@ CLIENT_ID = 0
 
 TIMEZONE = ZoneInfo("America/Toronto")
 
-BLOCKED_WEEKDAY = 1
-BLOCK_END_TIME = clock_time(10, 0)
+MARKET_OPEN_DIRECTION_BLOCK_START = clock_time(9, 30)
+MARKET_OPEN_DIRECTION_BLOCK_END = clock_time(9, 40)
 
-MARKET_OPEN_SELL_BLOCK_START = clock_time(9, 30)
-MARKET_OPEN_SELL_BLOCK_END = clock_time(9, 40)
+TUESDAY_SELL_BLOCK_END = clock_time(10, 55)
 
-# Block all BUY and SELL orders during IBKR overnight trading hours.
-OVERNIGHT_BLOCK_START = clock_time(20, 0)
-OVERNIGHT_BLOCK_END = clock_time(4, 0)
+# During IBKR overnight trading hours, allow at most 2 BUYs and 2 SELLs
+# across all stock symbols per overnight session (8:00 PM to 4:00 AM Toronto time).
+OVERNIGHT_START = clock_time(20, 0)
+OVERNIGHT_END = clock_time(4, 0)
+MAX_OVERNIGHT_BUYS = 2
+MAX_OVERNIGHT_SELLS = 2
+OVERNIGHT_HISTORY_FILE = Path(__file__).with_name("overnight_order_history.json")
 
-ALL_ORDERS_BLOCK_WINDOWS = (
-    (clock_time(10, 50), clock_time(10, 59)),
-    (clock_time(11, 50), clock_time(11, 59)),
-)
+# LONG  -> Market-open SELL orders are disabled.
+# SHORT -> Market-open BUY orders are disabled.
+# NONE  -> No market-open directional lock is applied.
+POSITION_SIDE = "SHORT"  # Options: "LONG", "SHORT", "NONE"
 
-MAX_SHORT_POSITION_VALUE = 6000
-MAX_SINGLE_ORDER_VALUE = 6000
-MAX_BUY_FILLS_PER_DAY = 3
-MAX_SELL_FILLS_PER_DAY = 3
-FILLED_COUNT_FILE = Path(__file__).with_name("daily_filled_counts.json")
+MAX_POSITION_VALUE = 12000
+
+MAX_BUY_FILLS_PER_HOUR = 3
+MAX_SELL_FILLS_PER_HOUR = 3
+FILL_WINDOW_SECONDS = 60 * 60
+FILLED_HISTORY_FILE = Path(__file__).with_name("hourly_filled_history.json")
 
 # The cooldown starts only after an order is completely filled.
 SAME_SIDE_FILLED_COOLDOWN_SECONDS = 10 * 60
+
+
+def show_position_increase_popup(symbol, action, current_position, quantity):
+    """Show a non-blocking native macOS warning when adding to an existing position."""
+    def popup():
+        try:
+            message = (
+                f"{symbol} {action} {quantity:g} shares\n\n"
+                f"Current position: {current_position:g}\n\n"
+                "YOU ARE INCREASING YOUR POSITION.\n"
+                "REMEMBER WHAT HAPPENED TO DRAM"
+            )
+
+            apple_script = """
+            on run argv
+                display alert "POSITION INCREASE" ¬
+                    message (item 1 of argv) ¬
+                    as warning ¬
+                    buttons {"OK"} ¬
+                    default button "OK"
+            end run
+            """
+
+            # Hide only osascript's normal "button returned:OK" output.
+            # AppleScript errors are still shown in the terminal via stderr.
+            subprocess.run(
+                ["osascript", "-e", apple_script, message],
+                check=False,
+                stdout=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"Could not show position-increase popup: {exc}")
+
+    Thread(target=popup, daemon=True).start()
 
 
 class OrderBlocker(EWrapper, EClient):
@@ -66,113 +105,255 @@ class OrderBlocker(EWrapper, EClient):
 
         self.last_completed_order_times = {}
 
-        self.daily_filled_counts = {}
-        self.daily_filled_count_date = datetime.now(TIMEZONE).date()
-        self.load_daily_filled_counts()
+        self.hourly_filled_history = {}
+        self.load_hourly_filled_history()
 
-    def load_daily_filled_counts(self):
+        self.overnight_order_history = {}
+        self.load_overnight_order_history()
+
+    def prune_hourly_filled_history(self):
+        cutoff = datetime.now(TIMEZONE).timestamp() - FILL_WINDOW_SECONDS
+
+        for key in list(self.hourly_filled_history):
+            recent = [
+                ts for ts in self.hourly_filled_history[key]
+                if ts >= cutoff
+            ]
+
+            if recent:
+                self.hourly_filled_history[key] = recent
+            else:
+                self.hourly_filled_history.pop(key, None)
+
+    def load_hourly_filled_history(self):
         try:
-            if not FILLED_COUNT_FILE.exists():
+            if not FILLED_HISTORY_FILE.exists():
                 return
 
-            data = json.loads(FILLED_COUNT_FILE.read_text())
-            saved_date = data.get("date")
-            today = str(datetime.now(TIMEZONE).date())
+            data = json.loads(FILLED_HISTORY_FILE.read_text())
 
-            if saved_date != today:
-                return
-
-            for item in data.get("counts", []):
+            for item in data.get("fills", []):
                 con_id = int(item["conId"])
                 action = str(item["action"]).upper()
-                count = int(item["count"])
-                self.daily_filled_counts[(con_id, action)] = count
+                timestamps = [float(ts) for ts in item.get("timestamps", [])]
+                self.hourly_filled_history[(con_id, action)] = timestamps
 
-            if self.daily_filled_counts:
-                print("Restored today's completed BUY/SELL fill counts.")
+            self.prune_hourly_filled_history()
+
+            if self.hourly_filled_history:
+                print("Restored completed BUY/SELL fills from the last hour.")
         except Exception as exc:
-            print(f"Could not load filled-count file: {exc}")
+            print(f"Could not load hourly filled-history file: {exc}")
 
-    def save_daily_filled_counts(self):
+    def save_hourly_filled_history(self):
         try:
-            counts = [
-                {"conId": con_id, "action": action, "count": count}
-                for (con_id, action), count in self.daily_filled_counts.items()
+            self.prune_hourly_filled_history()
+            fills = [
+                {
+                    "conId": con_id,
+                    "action": action,
+                    "timestamps": timestamps,
+                }
+                for (con_id, action), timestamps
+                in self.hourly_filled_history.items()
             ]
-            data = {
-                "date": str(self.daily_filled_count_date),
-                "counts": counts,
-            }
-            FILLED_COUNT_FILE.write_text(json.dumps(data, indent=2))
+            FILLED_HISTORY_FILE.write_text(
+                json.dumps({"fills": fills}, indent=2)
+            )
         except Exception as exc:
-            print(f"Could not save filled-count file: {exc}")
+            print(f"Could not save hourly filled-history file: {exc}")
 
-    def reset_daily_filled_counts_if_needed(self):
-        today = datetime.now(TIMEZONE).date()
-
-        if today != self.daily_filled_count_date:
-            self.daily_filled_counts.clear()
-            self.daily_filled_count_date = today
-            self.save_daily_filled_counts()
-            print(f"Daily completed BUY/SELL fill counts reset: {today}")
-
-    def daily_filled_limit_reached(self, con_id, symbol, action):
+    def hourly_filled_limit_reached(self, con_id, symbol, action):
         if action not in {"BUY", "SELL"}:
             return False
 
-        self.reset_daily_filled_counts_if_needed()
+        self.prune_hourly_filled_history()
 
         key = (con_id, action)
-        current_count = self.daily_filled_counts.get(key, 0)
+        current_count = len(self.hourly_filled_history.get(key, []))
         maximum = (
-            MAX_BUY_FILLS_PER_DAY
+            MAX_BUY_FILLS_PER_HOUR
             if action == "BUY"
-            else MAX_SELL_FILLS_PER_DAY
+            else MAX_SELL_FILLS_PER_HOUR
         )
 
         if current_count >= maximum:
+            oldest = min(self.hourly_filled_history[key])
+            seconds_until_available = max(0, int(oldest + FILL_WINDOW_SECONDS - datetime.now(TIMEZONE).timestamp()))
+            minutes = seconds_until_available // 60
+            seconds = seconds_until_available % 60
+
             print(
-                f"Daily completed-fill limit reached: "
+                f"Hourly completed-fill limit reached: "
                 f"{symbol} already has {current_count}/{maximum} "
-                f"filled {action} orders today. Cancelling the new order."
+                f"filled {action} orders in the last 60 minutes. "
+                f"Cancelling the new order. Next slot in about "
+                f"{minutes}m {seconds}s."
             )
             return True
 
         return False
 
-    def record_daily_completed_fill(self, con_id, symbol, action):
+    def record_hourly_completed_fill(self, con_id, symbol, action):
         if action not in {"BUY", "SELL"}:
             return
 
-        self.reset_daily_filled_counts_if_needed()
+        self.prune_hourly_filled_history()
 
         key = (con_id, action)
-        self.daily_filled_counts[key] = self.daily_filled_counts.get(key, 0) + 1
+        self.hourly_filled_history.setdefault(key, []).append(
+            datetime.now(TIMEZONE).timestamp()
+        )
 
         maximum = (
-            MAX_BUY_FILLS_PER_DAY
+            MAX_BUY_FILLS_PER_HOUR
             if action == "BUY"
-            else MAX_SELL_FILLS_PER_DAY
+            else MAX_SELL_FILLS_PER_HOUR
         )
+        current_count = len(self.hourly_filled_history[key])
 
-        self.save_daily_filled_counts()
+        self.save_hourly_filled_history()
 
         print(
-            f"Daily completed-fill count: {symbol} {action} "
-            f"{self.daily_filled_counts[key]}/{maximum}."
+            f"Hourly completed-fill count: {symbol} {action} "
+            f"{current_count}/{maximum} in the last 60 minutes."
         )
 
-        if self.daily_filled_counts[key] >= maximum:
+        if current_count >= maximum:
             for pending_order_id, pending in list(self.active_stock_orders.items()):
                 if (
                     pending["conId"] == con_id
                     and pending["action"] == action
                 ):
                     print(
-                        f"Daily {action} fill limit is now reached for {symbol}. "
+                        f"Hourly {action} fill limit is now reached for {symbol}. "
                         f"Cancelling pending order {pending_order_id}."
                     )
                     self.request_cancel(pending_order_id)
+
+    def is_overnight(self, now=None):
+        if now is None:
+            now = datetime.now(TIMEZONE)
+
+        current_time = now.time()
+        return current_time >= OVERNIGHT_START or current_time < OVERNIGHT_END
+
+    def overnight_session_key(self, now=None):
+        if now is None:
+            now = datetime.now(TIMEZONE)
+
+        # The session is named by the calendar date on which it begins at 8:00 PM.
+        if now.time() < OVERNIGHT_END:
+            session_date = now.date().fromordinal(now.date().toordinal() - 1)
+        else:
+            session_date = now.date()
+
+        return session_date.isoformat()
+
+    def load_overnight_order_history(self):
+        try:
+            if not OVERNIGHT_HISTORY_FILE.exists():
+                return
+
+            data = json.loads(OVERNIGHT_HISTORY_FILE.read_text())
+            session_key = self.overnight_session_key()
+
+            if data.get("session") == session_key:
+                self.overnight_order_history = {
+                    "BUY": int(data.get("BUY", 0)),
+                    "SELL": int(data.get("SELL", 0)),
+                }
+                print(
+                    "Restored overnight order counts: "
+                    f"BUY={self.overnight_order_history['BUY']}/"
+                    f"{MAX_OVERNIGHT_BUYS}, "
+                    f"SELL={self.overnight_order_history['SELL']}/"
+                    f"{MAX_OVERNIGHT_SELLS}."
+                )
+            else:
+                self.overnight_order_history = {"BUY": 0, "SELL": 0}
+        except Exception as exc:
+            print(f"Could not load overnight order-history file: {exc}")
+            self.overnight_order_history = {"BUY": 0, "SELL": 0}
+
+    def save_overnight_order_history(self):
+        try:
+            session_key = self.overnight_session_key()
+            data = {
+                "session": session_key,
+                "BUY": int(self.overnight_order_history.get("BUY", 0)),
+                "SELL": int(self.overnight_order_history.get("SELL", 0)),
+            }
+            OVERNIGHT_HISTORY_FILE.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            print(f"Could not save overnight order-history file: {exc}")
+
+    def refresh_overnight_session(self, now=None):
+        if now is None:
+            now = datetime.now(TIMEZONE)
+
+        session_key = self.overnight_session_key(now)
+
+        try:
+            if OVERNIGHT_HISTORY_FILE.exists():
+                data = json.loads(OVERNIGHT_HISTORY_FILE.read_text())
+                stored_session = data.get("session")
+            else:
+                stored_session = None
+        except Exception:
+            stored_session = None
+
+        if stored_session != session_key:
+            self.overnight_order_history = {"BUY": 0, "SELL": 0}
+            self.save_overnight_order_history()
+
+    def overnight_limit_reached(self, action, now=None):
+        if action not in {"BUY", "SELL"}:
+            return False
+
+        if now is None:
+            now = datetime.now(TIMEZONE)
+
+        if not self.is_overnight(now):
+            return False
+
+        self.refresh_overnight_session(now)
+
+        maximum = (
+            MAX_OVERNIGHT_BUYS
+            if action == "BUY"
+            else MAX_OVERNIGHT_SELLS
+        )
+        current_count = int(self.overnight_order_history.get(action, 0))
+
+        return current_count >= maximum
+
+    def record_overnight_order(self, action, symbol, order_id, now=None):
+        if action not in {"BUY", "SELL"}:
+            return
+
+        if now is None:
+            now = datetime.now(TIMEZONE)
+
+        if not self.is_overnight(now):
+            return
+
+        self.refresh_overnight_session(now)
+        self.overnight_order_history[action] = (
+            int(self.overnight_order_history.get(action, 0)) + 1
+        )
+        self.save_overnight_order_history()
+
+        maximum = (
+            MAX_OVERNIGHT_BUYS
+            if action == "BUY"
+            else MAX_OVERNIGHT_SELLS
+        )
+
+        print(
+            f"Overnight {action} slot used by order {order_id} for {symbol}: "
+            f"{self.overnight_order_history[action]}/{maximum}."
+        )
 
     def nextValidId(self, order_id: int):
         print("Connected to TWS.")
@@ -267,6 +448,7 @@ class OrderBlocker(EWrapper, EClient):
                 "conId": con_id,
                 "symbol": symbol,
                 "action": action,
+                "quantity": quantity,
             }
 
         if not self.initial_orders_loaded:
@@ -288,117 +470,72 @@ class OrderBlocker(EWrapper, EClient):
 
         self.processed_orders.add(order_id)
 
-        should_cancel_all_orders = any(
-            start_time <= now.time() < end_time
-            for start_time, end_time in ALL_ORDERS_BLOCK_WINDOWS
-        )
-
-        if should_cancel_all_orders:
+        if (
+            security_type == "STK"
+            and action == "SELL"
+            and now.weekday() == 1
+            and now.time() < TUESDAY_SELL_BLOCK_END
+        ):
             print(
-                f"Time restriction triggered. "
-                f"Cancelling new {action} order {order_id} "
-                f"for {symbol}."
+                f"Tuesday SELL restriction triggered. "
+                f"Cancelling SELL order {order_id} for {symbol}. "
+                f"Stock SELL orders are blocked before "
+                f"{TUESDAY_SELL_BLOCK_END.strftime('%H:%M')} Toronto time."
             )
-
             self.request_cancel(order_id)
             return
 
-        should_cancel_overnight_order = (
+        if (
             security_type == "STK"
             and action in {"BUY", "SELL"}
-            and (
-                now.time() >= OVERNIGHT_BLOCK_START
-                or now.time() < OVERNIGHT_BLOCK_END
-            )
-        )
+            and self.is_overnight(now)
+        ):
+            if self.overnight_limit_reached(action, now):
+                maximum = (
+                    MAX_OVERNIGHT_BUYS
+                    if action == "BUY"
+                    else MAX_OVERNIGHT_SELLS
+                )
 
-        if should_cancel_overnight_order:
-            print(
-                f"Overnight trading restriction triggered. "
-                f"Cancelling {action} order {order_id} for {symbol}. "
-                f"Stock BUY and SELL orders are blocked from "
-                f"{OVERNIGHT_BLOCK_START.strftime('%H:%M')} to "
-                f"{OVERNIGHT_BLOCK_END.strftime('%H:%M')} "
-            )
+                print(
+                    f"Overnight {action} limit reached. "
+                    f"Cancelling order {order_id} for {symbol}. "
+                    f"Only {maximum} {action} order is allowed per "
+                    f"overnight session "
+                    f"({OVERNIGHT_START.strftime('%H:%M')}–"
+                    f"{OVERNIGHT_END.strftime('%H:%M')} Toronto time)."
+                )
 
-            self.request_cancel(order_id)
-            return
+                self.request_cancel(order_id)
+                return
 
-        should_cancel_tuesday_sell = (
-            now.weekday() == BLOCKED_WEEKDAY
-            and now.time() < BLOCK_END_TIME
-            and action == "SELL"
-        )
+            # Reserve the overnight slot immediately when the order is accepted,
+            # so a second order cannot slip through before the first one fills.
+            self.record_overnight_order(action, symbol, order_id, now)
 
-        if should_cancel_tuesday_sell:
-            print(
-                f"Tuesday restriction triggered. "
-                f"Cancelling SELL order {order_id} for {symbol}."
-            )
-
-            self.request_cancel(order_id)
-            return
-
-        should_cancel_market_open_sell = (
+        should_cancel_market_open_direction = (
             security_type == "STK"
-            and action == "SELL"
-            and MARKET_OPEN_SELL_BLOCK_START <= now.time() < MARKET_OPEN_SELL_BLOCK_END
+            and MARKET_OPEN_DIRECTION_BLOCK_START <= now.time() < MARKET_OPEN_DIRECTION_BLOCK_END
+            and (
+                (POSITION_SIDE == "SHORT" and action == "BUY")
+                or (POSITION_SIDE == "LONG" and action == "SELL")
+            )
         )
 
-        if should_cancel_market_open_sell:
+        if should_cancel_market_open_direction:
+            blocked_action = "BUY" if POSITION_SIDE == "SHORT" else "SELL"
+
             print(
-                f"Market-open SELL restriction triggered. "
-                f"Cancelling SELL order {order_id} for {symbol}. "
-                f"New stock SELL orders are blocked from "
-                f"{MARKET_OPEN_SELL_BLOCK_START.strftime('%H:%M')} to "
-                f"{MARKET_OPEN_SELL_BLOCK_END.strftime('%H:%M')} Toronto time."
+                f"Market-open direction restriction triggered: "
+                f"POSITION_SIDE={POSITION_SIDE}. "
+                f"Cancelling {blocked_action} order {order_id} for {symbol}. "
+                f"New stock {blocked_action} orders are blocked from "
+                f"{MARKET_OPEN_DIRECTION_BLOCK_START.strftime('%H:%M')} to "
+                f"{MARKET_OPEN_DIRECTION_BLOCK_END.strftime('%H:%M')} Toronto time."
             )
 
             self.request_cancel(order_id)
             return
-
-        if security_type == "STK":
-            if order_type not in {"LMT", "STP LMT"}:
-                print(
-                    f"Single-order value could not be verified: "
-                    f"{symbol} {action} order {order_id} is {order_type}. "
-                    "Only LMT and STP LMT stock orders are allowed."
-                )
-
-                self.request_cancel(order_id)
-                return
-
-            order_price = float(order.lmtPrice)
-
-            if order_price <= 0:
-                print(
-                    f"Invalid limit price. "
-                    f"Cancelling order {order_id}."
-                )
-
-                self.request_cancel(order_id)
-                return
-
-            single_order_value = quantity * order_price
-
-            if single_order_value > MAX_SINGLE_ORDER_VALUE:
-                print(
-                    f"Single-order limit exceeded: "
-                    f"{symbol} {action} order {order_id}, "
-                    f"quantity={quantity:.2f}, "
-                    f"price=${order_price:.2f}, "
-                    f"value=${single_order_value:.2f}, "
-                    f"maximum=${MAX_SINGLE_ORDER_VALUE:.2f}."
-                )
-
-                self.request_cancel(order_id)
-                return
-
-            print(
-                f"Single-order value check passed: "
-                f"{symbol} {action} order {order_id}, "
-                f"value=${single_order_value:.2f}."
-            )
 
         rule_key = (con_id, action)
         completed_at = self.last_completed_order_times.get(rule_key)
@@ -425,42 +562,78 @@ class OrderBlocker(EWrapper, EClient):
                 return
 
         if security_type == "STK" and action in {"BUY", "SELL"}:
-            if self.daily_filled_limit_reached(con_id, symbol, action):
+            if self.hourly_filled_limit_reached(con_id, symbol, action):
                 self.request_cancel(order_id)
                 return
 
-        if security_type == "STK" and action == "SELL":
-            if not self.positions_loaded:
-                print(
-                    f"Position information is not ready. "
-                    f"Cancelling SELL order {order_id} for safety."
-                )
-
-                self.request_cancel(order_id)
-                return
-
+        if security_type == "STK" and action in {"BUY", "SELL"}:
             current_position = self.positions.get(con_id, 0.0)
 
-            other_pending_sell_quantity = sum(
-                pending_order["quantity"]
+            # Warn whenever this order adds to an EXISTING position.
+            # Long + BUY  -> increasing a long position.
+            # Short + SELL -> increasing a short position.
+            # Reducing/closing or opening from flat does not trigger the popup.
+            is_increasing_position = (
+                (current_position > 1e-9 and action == "BUY")
+                or (current_position < -1e-9 and action == "SELL")
+            )
+
+            if is_increasing_position:
+                show_position_increase_popup(
+                    symbol,
+                    action,
+                    current_position,
+                    quantity,
+                )
+
+            other_pending_buy_quantity = sum(
+                pending_order.get("quantity", 0.0)
                 for pending_order_id, pending_order
-                in self.active_sell_orders.items()
+                in self.active_stock_orders.items()
                 if pending_order_id != order_id
                 and pending_order["conId"] == con_id
+                and pending_order["action"] == "BUY"
+            )
+
+            other_pending_sell_quantity = sum(
+                pending_order.get("quantity", 0.0)
+                for pending_order_id, pending_order
+                in self.active_stock_orders.items()
+                if pending_order_id != order_id
+                and pending_order["conId"] == con_id
+                and pending_order["action"] == "SELL"
             )
 
             projected_position = (
                 current_position
+                + other_pending_buy_quantity
                 - other_pending_sell_quantity
-                - quantity
+                + (quantity if action == "BUY" else -quantity)
             )
 
-            if projected_position < 0:
-                if order_type != "LMT":
+
+        if security_type == "STK" and action in {"BUY", "SELL"}:
+            # Apply MAX_POSITION_VALUE only when THIS order increases absolute exposure.
+            # Reducing or closing a position is always allowed by the position-value rule,
+            # even when the remaining position is still above MAX_POSITION_VALUE.
+            position_before_this_order = (
+                current_position
+                + other_pending_buy_quantity
+                - other_pending_sell_quantity
+            )
+            is_increasing_absolute_position = (
+                abs(projected_position) > abs(position_before_this_order) + 1e-9
+            )
+
+            if is_increasing_absolute_position and abs(projected_position) > 1e-9:
+                # A limit price is required only for orders that increase exposure,
+                # so the projected dollar value can be verified.
+                if order_type not in {"LMT", "STP LMT"}:
                     print(
-                        f"Short market order blocked: "
-                        f"{symbol} order {order_id}. "
-                        "Use a limit order so the short value can be checked."
+                        f"Position-value check could not be verified: "
+                        f"{symbol} {action} order {order_id} is {order_type}. "
+                        "Use LMT or STP LMT when increasing a position so the "
+                        "projected position value can be checked."
                     )
 
                     self.request_cancel(order_id)
@@ -477,32 +650,22 @@ class OrderBlocker(EWrapper, EClient):
                     self.request_cancel(order_id)
                     return
 
-                projected_short_shares = abs(projected_position)
-                projected_short_value = (
-                    projected_short_shares * limit_price
-                )
+                projected_position_value = abs(projected_position) * limit_price
+                projected_side = "LONG" if projected_position > 0 else "SHORT"
 
-                if projected_short_value > MAX_SHORT_POSITION_VALUE:
+                if projected_position_value > MAX_POSITION_VALUE:
                     print(
-                        f"Short-position limit exceeded: "
+                        f"Position-value limit exceeded while increasing position: "
                         f"{symbol}, "
-                        f"projected short shares="
-                        f"{projected_short_shares:.2f}, "
+                        f"projected {projected_side.lower()} shares="
+                        f"{abs(projected_position):.2f}, "
                         f"price=${limit_price:.2f}, "
-                        f"projected value="
-                        f"${projected_short_value:.2f}, "
-                        f"maximum=${MAX_SHORT_POSITION_VALUE:.2f}."
+                        f"projected value=${projected_position_value:.2f}, "
+                        f"maximum=${MAX_POSITION_VALUE:.2f}."
                     )
 
                     self.request_cancel(order_id)
                     return
-
-                print(
-                    f"Short-position check passed: "
-                    f"{symbol}, "
-                    f"projected short value="
-                    f"${projected_short_value:.2f}."
-                )
 
         print(
             f"{symbol} {action} order {order_id} allowed. "
@@ -567,7 +730,7 @@ class OrderBlocker(EWrapper, EClient):
                 details["completedRecorded"] = True
 
                 if security_type == "STK" and action in {"BUY", "SELL"}:
-                    self.record_daily_completed_fill(con_id, symbol, action)
+                    self.record_hourly_completed_fill(con_id, symbol, action)
 
                 print(
                     f"Cooldown started: {symbol} {action} order "
@@ -614,9 +777,9 @@ class OrderBlocker(EWrapper, EClient):
 def confirm_exit(signum, frame):
     print()
     print("Ctrl+C detected.")
-    confirmation = input('Type "THINK ABOUT NBIS" to stop the order blocker: ')
+    confirmation = input('Type "REMEMBER DRAM TRADE WITH 9EMA" to stop the order blocker: ')
 
-    if confirmation.strip() == "THINK ABOUT NBIS":
+    if confirmation.strip() == "REMEMBER DRAM TRADE WITH 9EMA":
         raise KeyboardInterrupt
 
     print("Incorrect phrase. Order blocker will continue running.")
@@ -654,28 +817,30 @@ def main():
 
     print()
     print("Order blocker is running.")
-    print("Tuesday SELL orders are blocked before 10:00 AM.")
-    print("New stock SELL orders are blocked from 9:30 AM to 9:40 AM Toronto time.")
     print(
-        "Stock BUY and SELL orders are blocked overnight from "
-        "8:00 PM to 4:00 AM Toronto time."
+        f"Market-open direction lock: {POSITION_SIDE.upper()} "
+        f"(SHORT blocks BUY; LONG blocks SELL) "
     )
     print(
-        f"Maximum single stock order value: "
-        f"${MAX_SINGLE_ORDER_VALUE:.2f}."
+        "Overnight stock trading limit: maximum 1 BUY and 1 SELL "
+        "from 8:00 PM to 4:00 AM Toronto time."
     )
     print(
-        f"Maximum projected stock short value: "
-        f"${MAX_SHORT_POSITION_VALUE:.2f}."
+        f"Maximum projected stock position value: "
+        f"${MAX_POSITION_VALUE:.2f}."
+    )
+    print(
+        f"Tuesday stock SELL orders are blocked before "
+        f"{TUESDAY_SELL_BLOCK_END.strftime('%H:%M')} Toronto time."
     )
     print(
         "After an order is fully filled, another order for the "
         "same ticker and same side is blocked for 10 minutes."
     )
     print(
-        f"Maximum completed fills per ticker per day: "
-        f"{MAX_BUY_FILLS_PER_DAY} BUY fills and "
-        f"{MAX_SELL_FILLS_PER_DAY} SELL fills."
+        f"Maximum completed fills per ticker in 60-minute window: "
+        f"{MAX_BUY_FILLS_PER_HOUR} BUY fills and "
+        f"{MAX_SELL_FILLS_PER_HOUR} SELL fills."
     )
     print("Press Control+C to stop.")
     print()
