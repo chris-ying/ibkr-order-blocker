@@ -1,4 +1,5 @@
 import json
+import math
 import time
 import signal
 import subprocess
@@ -21,7 +22,11 @@ TIMEZONE = ZoneInfo("America/Toronto")
 MARKET_OPEN_DIRECTION_BLOCK_START = clock_time(9, 30)
 MARKET_OPEN_DIRECTION_BLOCK_END = clock_time(9, 40)
 
-TUESDAY_SELL_BLOCK_END = clock_time(10, 55)
+BUY_CANCEL_BLOCK_START = clock_time(9, 0)
+BUY_CANCEL_BLOCK_END = clock_time(10, 00)
+
+TUESDAY_SELL_BLOCK_START = clock_time(9, 30)
+TUESDAY_SELL_BLOCK_END = clock_time(9, 50)
 
 # During IBKR overnight trading hours, allow at most 2 BUYs and 2 SELLs
 # across all stock symbols per overnight session (8:00 PM to 4:00 AM Toronto time).
@@ -34,9 +39,12 @@ OVERNIGHT_HISTORY_FILE = Path(__file__).with_name("overnight_order_history.json"
 # LONG  -> Market-open SELL orders are disabled.
 # SHORT -> Market-open BUY orders are disabled.
 # NONE  -> No market-open directional lock is applied.
-POSITION_SIDE = "SHORT"  # Options: "LONG", "SHORT", "NONE"
+POSITION_SIDE = "NONE"  # Options: "LONG", "SHORT", "NONE"
 
 MAX_POSITION_VALUE = 12000
+PROFIT_POPUP_POSITION_VALUE_MAX = 5000
+PROFIT_POPUP_UNREALIZED_MIN = 100
+PROFIT_POPUP_INTERVAL_SECONDS = 30 * 60
 
 MAX_BUY_FILLS_PER_HOUR = 3
 MAX_SELL_FILLS_PER_HOUR = 3
@@ -53,9 +61,7 @@ def show_position_increase_popup(symbol, action, current_position, quantity):
         try:
             message = (
                 f"{symbol} {action} {quantity:g} shares\n\n"
-                f"Current position: {current_position:g}\n\n"
-                "YOU ARE INCREASING YOUR POSITION.\n"
-                "REMEMBER WHAT HAPPENED TO DRAM"
+                f"Current position: {current_position:g}"
             )
 
             apple_script = """
@@ -68,8 +74,6 @@ def show_position_increase_popup(symbol, action, current_position, quantity):
             end run
             """
 
-            # Hide only osascript's normal "button returned:OK" output.
-            # AppleScript errors are still shown in the terminal via stderr.
             subprocess.run(
                 ["osascript", "-e", apple_script, message],
                 check=False,
@@ -77,6 +81,59 @@ def show_position_increase_popup(symbol, action, current_position, quantity):
             )
         except Exception as exc:
             print(f"Could not show position-increase popup: {exc}")
+
+    Thread(target=popup, daemon=True).start()
+
+
+def show_buy_cancel_popup():
+    """Show a non-blocking native macOS warning when a BUY order is cancelled during the protected window."""
+    def popup():
+        try:
+            apple_script = """
+            display alert "DO NOT CANCEL YOUR BUY ORDERS." ¬
+                as warning ¬
+                buttons {"OK"} ¬
+                default button "OK"
+            """
+
+            subprocess.run(
+                ["osascript", "-e", apple_script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"Could not show BUY-cancel popup: {exc}")
+
+    Thread(target=popup, daemon=True).start()
+
+
+def show_take_profit_popup(symbol, position_value, unrealized_pnl):
+    """Show a non-blocking native macOS warning for a profitable position."""
+    def popup():
+        try:
+            message = (
+                f"{symbol}\n\n"
+                f"Position value: ${abs(position_value):,.2f}\n"
+                f"Unrealized profit: ${unrealized_pnl:,.2f}"
+            )
+
+            apple_script = """
+            on run argv
+                display alert "LOCK IN $100 PROFITS" ¬
+                    message (item 1 of argv) ¬
+                    as warning ¬
+                    buttons {"OK"} ¬
+                    default button "OK"
+            end run
+            """
+
+            subprocess.run(
+                ["osascript", "-e", apple_script, message],
+                check=False,
+                stdout=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"Could not show take-profit popup: {exc}")
 
     Thread(target=popup, daemon=True).start()
 
@@ -104,6 +161,8 @@ class OrderBlocker(EWrapper, EClient):
         self.order_details = {}
 
         self.last_completed_order_times = {}
+        self.pnl_request_symbols = {}
+        self.last_profit_popup_times = {}
 
         self.hourly_filled_history = {}
         self.load_hourly_filled_history()
@@ -375,6 +434,30 @@ class OrderBlocker(EWrapper, EClient):
     def positionEnd(self):
         self.positions_loaded = True
 
+        for request_id in list(self.pnl_request_symbols):
+            self.cancelPnLSingle(request_id)
+
+        self.pnl_request_symbols.clear()
+
+        request_id = 900000
+        for con_id, quantity in self.positions.items():
+            if abs(quantity) <= 1e-9:
+                continue
+
+            account = self.position_accounts.get(con_id)
+            contract = self.position_contracts.get(con_id)
+
+            if not account or contract is None:
+                continue
+
+            symbol = str(contract.symbol).upper()
+            self.pnl_request_symbols[request_id] = {
+                "conId": con_id,
+                "symbol": symbol,
+            }
+            self.reqPnLSingle(request_id, account, "", con_id)
+            request_id += 1
+
     def openOrder(self, order_id, contract, order, order_state):
         now = datetime.now(TIMEZONE)
 
@@ -474,13 +557,13 @@ class OrderBlocker(EWrapper, EClient):
             security_type == "STK"
             and action == "SELL"
             and now.weekday() == 1
-            and now.time() < TUESDAY_SELL_BLOCK_END
+            and TUESDAY_SELL_BLOCK_START <= now.time() < TUESDAY_SELL_BLOCK_END
         ):
             print(
                 f"Tuesday SELL restriction triggered. "
                 f"Cancelling SELL order {order_id} for {symbol}. "
-                f"Stock SELL orders are blocked before "
-                f"{TUESDAY_SELL_BLOCK_END.strftime('%H:%M')} Toronto time."
+                f"Stock SELL orders are blocked from "
+                f"{TUESDAY_SELL_BLOCK_START.strftime('%H:%M')} to 09:59 Toronto time."
             )
             self.request_cancel(order_id)
             return
@@ -710,6 +793,17 @@ class OrderBlocker(EWrapper, EClient):
         normalized_status = str(status).strip().lower()
         remaining_quantity = float(remaining)
 
+        now = datetime.now(TIMEZONE)
+        details = self.order_details.get(order_id)
+
+        if (
+            normalized_status in {"cancelled", "apicancelled"}
+            and details is not None
+            and details.get("action") == "BUY"
+            and BUY_CANCEL_BLOCK_START <= now.time() < BUY_CANCEL_BLOCK_END
+        ):
+            show_buy_cancel_popup(details.get("symbol", ""))
+
         if normalized_status == "filled" and remaining_quantity <= 1e-9:
             details = self.order_details.get(order_id)
 
@@ -747,6 +841,53 @@ class OrderBlocker(EWrapper, EClient):
             self.active_stock_orders.pop(order_id, None)
             self.cancel_requested.discard(order_id)
 
+    def pnlSingle(self, req_id, pos, daily_pnl, unrealized_pnl, realized_pnl, value):
+        details = self.pnl_request_symbols.get(req_id)
+
+        if details is None:
+            return
+
+        symbol = details["symbol"]
+        position_value = float(value)
+        unrealized = float(unrealized_pnl)
+
+        if abs(float(pos)) <= 1e-9:
+            return
+
+        # IBKR can return ~1.7976931348623157e308 when P&L/value is unavailable.
+        # Ignore those sentinel/invalid values, and ignore zero-value placeholder positions.
+        if not math.isfinite(position_value) or not math.isfinite(unrealized):
+            return
+
+        if abs(position_value) <= 0.01:
+            return
+
+        if abs(unrealized) > 1e100:
+            return
+
+        if abs(position_value) <= 1:
+            return
+
+        if unrealized <= PROFIT_POPUP_UNREALIZED_MIN:
+            return
+
+        if unrealized <= abs(position_value) * 0.02:
+            return
+
+        now = time.monotonic()
+        last_popup = self.last_profit_popup_times.get(symbol, 0.0)
+
+        if now - last_popup < PROFIT_POPUP_INTERVAL_SECONDS:
+            return
+
+        self.last_profit_popup_times[symbol] = now
+        print(
+            f"Profit reminder: {symbol}, "
+            f"position value=${abs(position_value):.2f}, "
+            f"unrealized P&L=${unrealized:.2f}."
+        )
+        show_profit_popup(symbol, position_value, unrealized)
+
     def connectionClosed(self):
         print("TWS API connection closed.")
 
@@ -761,6 +902,7 @@ class OrderBlocker(EWrapper, EClient):
             2104,
             2106,
             2108,
+            2150,
             2158,
         }
 
@@ -822,7 +964,7 @@ def main():
         f"(SHORT blocks BUY; LONG blocks SELL) "
     )
     print(
-        "Overnight stock trading limit: maximum 1 BUY and 1 SELL "
+        f"Overnight stock trading limit: maximum {MAX_OVERNIGHT_BUYS} BUY and {MAX_OVERNIGHT_SELLS} SELL "
         "from 8:00 PM to 4:00 AM Toronto time."
     )
     print(
@@ -830,8 +972,8 @@ def main():
         f"${MAX_POSITION_VALUE:.2f}."
     )
     print(
-        f"Tuesday stock SELL orders are blocked before "
-        f"{TUESDAY_SELL_BLOCK_END.strftime('%H:%M')} Toronto time."
+        f"Tuesday stock SELL orders are blocked from "
+        f"{TUESDAY_SELL_BLOCK_START.strftime('%H:%M')} to 09:59 Toronto time."
     )
     print(
         "After an order is fully filled, another order for the "
