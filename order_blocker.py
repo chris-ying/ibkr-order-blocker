@@ -42,6 +42,9 @@ OVERNIGHT_HISTORY_FILE = Path(__file__).with_name("overnight_order_history.json"
 POSITION_SIDE = "NONE"  # Options: "LONG", "SHORT", "NONE"
 
 MAX_POSITION_VALUE = 12000
+EXISTING_ORDER_BLOCK_START = clock_time(9, 30)
+EXISTING_ORDER_BLOCK_END = clock_time(10, 00)
+MAX_NEW_ORDER_VALUE_WITH_EXISTING_ORDER = 5000
 PROFIT_POPUP_POSITION_VALUE_MAX = 5000
 PROFIT_POPUP_UNREALIZED_MIN = 100
 PROFIT_POPUP_INTERVAL_SECONDS = 30 * 60
@@ -113,8 +116,8 @@ def show_take_profit_popup(symbol, position_value, unrealized_pnl):
         try:
             message = (
                 f"{symbol}\n\n"
-                f"Position value: ${abs(position_value):,.2f}\n"
-                f"Unrealized profit: ${unrealized_pnl:,.2f}"
+                f"Position value: ${abs(position_value):,.0f}\n"
+                f"Unrealized profit: ${unrealized_pnl:,.0f}"
             )
 
             apple_script = """
@@ -162,6 +165,7 @@ class OrderBlocker(EWrapper, EClient):
 
         self.last_completed_order_times = {}
         self.pnl_request_symbols = {}
+        self.next_pnl_request_id = 900000
         self.last_profit_popup_times = {}
 
         self.hourly_filled_history = {}
@@ -439,7 +443,6 @@ class OrderBlocker(EWrapper, EClient):
 
         self.pnl_request_symbols.clear()
 
-        request_id = 900000
         for con_id, quantity in self.positions.items():
             if abs(quantity) <= 1e-9:
                 continue
@@ -451,12 +454,14 @@ class OrderBlocker(EWrapper, EClient):
                 continue
 
             symbol = str(contract.symbol).upper()
+            request_id = self.next_pnl_request_id
+            self.next_pnl_request_id += 1
+
             self.pnl_request_symbols[request_id] = {
                 "conId": con_id,
                 "symbol": symbol,
             }
             self.reqPnLSingle(request_id, account, "", con_id)
-            request_id += 1
 
     def openOrder(self, order_id, contract, order, order_state):
         now = datetime.now(TIMEZONE)
@@ -652,6 +657,45 @@ class OrderBlocker(EWrapper, EClient):
         if security_type == "STK" and action in {"BUY", "SELL"}:
             current_position = self.positions.get(con_id, 0.0)
 
+            # If this symbol already has a position AND another active order
+            # on the SAME side as this new order, apply the existing-order restriction.
+            # Existing BUY only restricts a new BUY.
+            # Existing SELL only restricts a new SELL.
+            has_other_active_same_side_order = any(
+                pending_order_id != order_id
+                and pending_order.get("conId") == con_id
+                and pending_order.get("action") == action
+                for pending_order_id, pending_order in self.active_stock_orders.items()
+            )
+
+            if abs(current_position) > 1e-9 and has_other_active_same_side_order:
+                if EXISTING_ORDER_BLOCK_START <= now.time() < EXISTING_ORDER_BLOCK_END:
+                    print(
+                        f"Existing-position/order restriction triggered: "
+                        f"{symbol} already has a position and another active {action} order. "
+                        f"Cancelling order {order_id}; additional same-side orders are blocked from "
+                        f"{EXISTING_ORDER_BLOCK_START.strftime('%H:%M')} to "
+                        f"{EXISTING_ORDER_BLOCK_END.strftime('%H:%M')} Toronto time."
+                    )
+                    self.request_cancel(order_id)
+                    return
+
+                if order_type in {"LMT", "STP LMT"}:
+                    new_order_price = float(order.lmtPrice)
+
+                    if new_order_price > 0:
+                        new_order_value = abs(quantity * new_order_price)
+
+                        if new_order_value > MAX_NEW_ORDER_VALUE_WITH_EXISTING_ORDER:
+                            print(
+                                f"New-order value limit exceeded: {symbol} {action} order {order_id}, "
+                                f"quantity={quantity:.0f}, price=${new_order_price:.0f}, "
+                                f"order value=${new_order_value:.0f}, "
+                                f"maximum=${MAX_NEW_ORDER_VALUE_WITH_EXISTING_ORDER:.0f}."
+                            )
+                            self.request_cancel(order_id)
+                            return
+
             # Warn whenever this order adds to an EXISTING position.
             # Long + BUY  -> increasing a long position.
             # Short + SELL -> increasing a short position.
@@ -741,10 +785,10 @@ class OrderBlocker(EWrapper, EClient):
                         f"Position-value limit exceeded while increasing position: "
                         f"{symbol}, "
                         f"projected {projected_side.lower()} shares="
-                        f"{abs(projected_position):.2f}, "
-                        f"price=${limit_price:.2f}, "
-                        f"projected value=${projected_position_value:.2f}, "
-                        f"maximum=${MAX_POSITION_VALUE:.2f}."
+                        f"{abs(projected_position):.0f}, "
+                        f"price=${limit_price:.0f}, "
+                        f"projected value=${projected_position_value:.0f}, "
+                        f"maximum=${MAX_POSITION_VALUE:.0f}."
                     )
 
                     self.request_cancel(order_id)
@@ -882,11 +926,11 @@ class OrderBlocker(EWrapper, EClient):
 
         self.last_profit_popup_times[symbol] = now
         print(
-            f"Profit reminder: {symbol}, "
-            f"position value=${abs(position_value):.2f}, "
-            f"unrealized P&L=${unrealized:.2f}."
+            f"Take Profit Reminder: {symbol}, "
+            f"Position Value=${abs(position_value):.0f}, "
+            f"Unrealized Profit=${unrealized:.0f}."
         )
-        show_profit_popup(symbol, position_value, unrealized)
+        show_take_profit_popup(symbol, position_value, unrealized)
 
     def connectionClosed(self):
         print("TWS API connection closed.")
@@ -969,7 +1013,13 @@ def main():
     )
     print(
         f"Maximum projected stock position value: "
-        f"${MAX_POSITION_VALUE:.2f}."
+        f"${MAX_POSITION_VALUE:.0f}."
+    )
+    print(
+        f"If a stock has a position and an active order, new orders are blocked from "
+        f"{EXISTING_ORDER_BLOCK_START.strftime('%H:%M')} to "
+        f"{EXISTING_ORDER_BLOCK_END.strftime('%H:%M')} "
+        f"or above ${MAX_NEW_ORDER_VALUE_WITH_EXISTING_ORDER:.0f}."
     )
     print(
         f"Tuesday stock SELL orders are blocked from "
