@@ -19,27 +19,27 @@ CLIENT_ID = 0
 
 TIMEZONE = ZoneInfo("America/Toronto")
 
-MARKET_OPEN_DIRECTION_BLOCK_START = clock_time(9, 30)
-MARKET_OPEN_DIRECTION_BLOCK_END = clock_time(9, 40)
+MARKET_OPEN_ORDER_BLOCK_START = clock_time(9, 30)
+MARKET_OPEN_ORDER_BLOCK_END = clock_time(9, 40)
 
 BUY_CANCEL_BLOCK_START = clock_time(9, 0)
 BUY_CANCEL_BLOCK_END = clock_time(10, 00)
 
-TUESDAY_SELL_BLOCK_START = clock_time(9, 30)
-TUESDAY_SELL_BLOCK_END = clock_time(9, 50)
+STOP_BUY_REMINDER_TIME = clock_time(9, 20)
+STOP_BUY_REMINDER_END = clock_time(9, 30)
 
-# During IBKR overnight trading hours, allow at most 2 BUYs and 2 SELLs
-# across all stock symbols per overnight session (8:00 PM to 4:00 AM Toronto time).
+WHOLE_DOLLAR_SELL_PRICE_START = clock_time(9, 30)
+WHOLE_DOLLAR_SELL_PRICE_END = clock_time(15, 0)
+WHOLE_DOLLAR_SELL_COOLDOWN_SECONDS = 10 * 60
+
+TUESDAY_SELL_BLOCK_START = clock_time(9, 30)
+TUESDAY_SELL_BLOCK_END = clock_time(9, 55)
+
 OVERNIGHT_START = clock_time(20, 0)
 OVERNIGHT_END = clock_time(4, 0)
 MAX_OVERNIGHT_BUYS = 2
 MAX_OVERNIGHT_SELLS = 2
 OVERNIGHT_HISTORY_FILE = Path(__file__).with_name("overnight_order_history.json")
-
-# LONG  -> Market-open SELL orders are disabled.
-# SHORT -> Market-open BUY orders are disabled.
-# NONE  -> No market-open directional lock is applied.
-POSITION_SIDE = "NONE"  # Options: "LONG", "SHORT", "NONE"
 
 MAX_POSITION_VALUE = 12000
 EXISTING_ORDER_BLOCK_START = clock_time(9, 30)
@@ -49,8 +49,8 @@ PROFIT_POPUP_POSITION_VALUE_MAX = 5000
 PROFIT_POPUP_UNREALIZED_MIN = 100
 PROFIT_POPUP_INTERVAL_SECONDS = 30 * 60
 
-MAX_BUY_FILLS_PER_HOUR = 3
-MAX_SELL_FILLS_PER_HOUR = 3
+MAX_BUY_FILLS_PER_HOUR = 2
+MAX_SELL_FILLS_PER_HOUR = 2
 FILL_WINDOW_SECONDS = 60 * 60
 FILLED_HISTORY_FILE = Path(__file__).with_name("hourly_filled_history.json")
 
@@ -110,6 +110,28 @@ def show_buy_cancel_popup():
     Thread(target=popup, daemon=True).start()
 
 
+def show_stop_buy_reminder_popup():
+    """Show a non-blocking macOS reminder to place stop BUY orders before market open."""
+    def popup():
+        try:
+            apple_script = """
+            display alert "PLACE STOP BUY ORDERS" ¬
+                as warning ¬
+                buttons {"OK"} ¬
+                default button "OK"
+            """
+
+            subprocess.run(
+                ["osascript", "-e", apple_script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"Could not show stop-BUY reminder popup: {exc}")
+
+    Thread(target=popup, daemon=True).start()
+
+
 def show_take_profit_popup(symbol, position_value, unrealized_pnl):
     """Show a non-blocking native macOS warning for a profitable position."""
     def popup():
@@ -146,6 +168,7 @@ class OrderBlocker(EWrapper, EClient):
         EClient.__init__(self, self)
 
         self.ready = Event()
+        self.stop_buy_reminder_date = None
         self.initial_orders_loaded = False
         self.positions_loaded = False
 
@@ -164,9 +187,12 @@ class OrderBlocker(EWrapper, EClient):
         self.order_details = {}
 
         self.last_completed_order_times = {}
+        self.whole_dollar_sell_blocked_times = {}
         self.pnl_request_symbols = {}
         self.next_pnl_request_id = 900000
         self.last_profit_popup_times = {}
+        self.position_values = {}
+        self.unrealized_pnls = {}
 
         self.hourly_filled_history = {}
         self.load_hourly_filled_history()
@@ -421,11 +447,32 @@ class OrderBlocker(EWrapper, EClient):
     def nextValidId(self, order_id: int):
         print("Connected to TWS.")
         print(f"Next valid API order ID: {order_id}")
-
         self.reqPositions()
         self.reqAutoOpenOrders(True)
         self.reqOpenOrders()
         self.ready.set()
+
+
+    def has_active_stop_buy_order(self):
+        return any(
+            pending.get("action") == "BUY"
+            and pending.get("orderType") in {"STP", "STP LMT"}
+            for pending in self.active_stock_orders.values()
+        )
+
+    def stop_buy_reminder_loop(self):
+        while self.isConnected():
+            now = datetime.now(TIMEZONE)
+            today = now.date()
+
+            if STOP_BUY_REMINDER_TIME <= now.time() < STOP_BUY_REMINDER_END:
+                if self.stop_buy_reminder_date != today:
+                    self.stop_buy_reminder_date = today
+
+                    if not self.has_active_stop_buy_order():
+                        show_stop_buy_reminder_popup()
+
+            time.sleep(1)
 
     def position(self, account, contract, position, avg_cost):
         con_id = int(contract.conId)
@@ -482,6 +529,8 @@ class OrderBlocker(EWrapper, EClient):
                 "symbol": symbol,
                 "action": action,
                 "securityType": security_type,
+                "orderType": order_type,
+                "orderRef": str(getattr(order, "orderRef", "")),
                 "completedRecorded": False,
             },
         )
@@ -491,6 +540,8 @@ class OrderBlocker(EWrapper, EClient):
         details["symbol"] = symbol
         details["action"] = action
         details["securityType"] = security_type
+        details["orderType"] = order_type
+        details["orderRef"] = str(getattr(order, "orderRef", ""))
 
         log_key = (
             order_id,
@@ -537,6 +588,8 @@ class OrderBlocker(EWrapper, EClient):
                 "symbol": symbol,
                 "action": action,
                 "quantity": quantity,
+                "orderType": order_type,
+                "orderRef": str(getattr(order, "orderRef", "")),
             }
 
         if not self.initial_orders_loaded:
@@ -558,8 +611,29 @@ class OrderBlocker(EWrapper, EClient):
 
         self.processed_orders.add(order_id)
 
+        # Global exception: always allow an order that only reduces or fully closes
+        # a currently losing stock or option position. It must not reverse past flat.
+        current_position = self.positions.get(con_id, 0.0)
+        unrealized_pnl = self.unrealized_pnls.get(con_id)
+        is_losing_position_close = (
+            security_type in {"STK", "OPT"}
+            and unrealized_pnl is not None
+            and unrealized_pnl < 0
+            and (
+                (current_position > 1e-9 and action == "SELL" and quantity <= current_position + 1e-9)
+                or (current_position < -1e-9 and action == "BUY" and quantity <= abs(current_position) + 1e-9)
+            )
+        )
+
+        if is_losing_position_close:
+            print(
+                f"Loss-closing exception: allowing {symbol} {action} order {order_id} "
+                f"to reduce/close a losing position."
+            )
+            return
+
         if (
-            security_type == "STK"
+            security_type in {"STK", "OPT"}
             and action == "SELL"
             and now.weekday() == 1
             and TUESDAY_SELL_BLOCK_START <= now.time() < TUESDAY_SELL_BLOCK_END
@@ -567,8 +641,8 @@ class OrderBlocker(EWrapper, EClient):
             print(
                 f"Tuesday SELL restriction triggered. "
                 f"Cancelling SELL order {order_id} for {symbol}. "
-                f"Stock SELL orders are blocked from "
-                f"{TUESDAY_SELL_BLOCK_START.strftime('%H:%M')} to 09:59 Toronto time."
+                f"Stock and option SELL orders are blocked from "
+                f"{TUESDAY_SELL_BLOCK_START.strftime('%H:%M')} to {TUESDAY_SELL_BLOCK_END.strftime('%H:%M')}."
             )
             self.request_cancel(order_id)
             return
@@ -591,7 +665,7 @@ class OrderBlocker(EWrapper, EClient):
                     f"Only {maximum} {action} order is allowed per "
                     f"overnight session "
                     f"({OVERNIGHT_START.strftime('%H:%M')}–"
-                    f"{OVERNIGHT_END.strftime('%H:%M')} Toronto time)."
+                    f"{OVERNIGHT_END.strftime('%H:%M')})."
                 )
 
                 self.request_cancel(order_id)
@@ -601,33 +675,27 @@ class OrderBlocker(EWrapper, EClient):
             # so a second order cannot slip through before the first one fills.
             self.record_overnight_order(action, symbol, order_id, now)
 
-        should_cancel_market_open_direction = (
-            security_type == "STK"
-            and MARKET_OPEN_DIRECTION_BLOCK_START <= now.time() < MARKET_OPEN_DIRECTION_BLOCK_END
-            and (
-                (POSITION_SIDE == "SHORT" and action == "BUY")
-                or (POSITION_SIDE == "LONG" and action == "SELL")
-            )
-        )
-
-        if should_cancel_market_open_direction:
-            blocked_action = "BUY" if POSITION_SIDE == "SHORT" else "SELL"
-
+        # From 09:30 to 09:40, block every NEW stock/option BUY and SELL order.
+        # Existing orders loaded when the script starts are left untouched.
+        # Losing-position closes already returned above under the global exception.
+        if (
+            security_type in {"STK", "OPT"}
+            and action in {"BUY", "SELL"}
+            and MARKET_OPEN_ORDER_BLOCK_START <= now.time() < MARKET_OPEN_ORDER_BLOCK_END
+        ):
             print(
-                f"Market-open direction restriction triggered: "
-                f"POSITION_SIDE={POSITION_SIDE}. "
-                f"Cancelling {blocked_action} order {order_id} for {symbol}. "
-                f"New stock {blocked_action} orders are blocked from "
-                f"{MARKET_OPEN_DIRECTION_BLOCK_START.strftime('%H:%M')} to "
-                f"{MARKET_OPEN_DIRECTION_BLOCK_END.strftime('%H:%M')} Toronto time."
+                f"Market-open order block triggered. "
+                f"Cancelling {symbol} {action} order {order_id}. "
+                f"New stock and option BUY/SELL orders are blocked from "
+                f"{MARKET_OPEN_ORDER_BLOCK_START.strftime('%H:%M')} to "
+                f"{MARKET_OPEN_ORDER_BLOCK_END.strftime('%H:%M')}, "
+                f"except orders that reduce/close a losing position."
             )
-
             self.request_cancel(order_id)
             return
 
         rule_key = (con_id, action)
         completed_at = self.last_completed_order_times.get(rule_key)
-
         if completed_at is not None:
             elapsed = time.monotonic() - completed_at
 
@@ -649,13 +717,63 @@ class OrderBlocker(EWrapper, EClient):
                 self.request_cancel(order_id)
                 return
 
-        if security_type == "STK" and action in {"BUY", "SELL"}:
+        if security_type in {"STK", "OPT"} and action in {"BUY", "SELL"}:
             if self.hourly_filled_limit_reached(con_id, symbol, action):
                 self.request_cancel(order_id)
                 return
 
         if security_type == "STK" and action in {"BUY", "SELL"}:
-            current_position = self.positions.get(con_id, 0.0)
+            # While holding a winning long position, the first non-whole-dollar SELL limit order
+            # during the protected window is cancelled and starts a 10-minute cooldown.
+            # Losing or breakeven long positions are not subject to this restriction.
+            # After 10 minutes, non-whole-dollar SELL prices are allowed again.
+            unrealized_pnl = self.unrealized_pnls.get(con_id)
+
+            if (
+                current_position > 1e-9
+                and unrealized_pnl is not None
+                and unrealized_pnl > 0
+                and action == "SELL"
+                and WHOLE_DOLLAR_SELL_PRICE_START <= now.time() < WHOLE_DOLLAR_SELL_PRICE_END
+                and order_type == "LMT"
+            ):
+                sell_price = float(order.lmtPrice)
+
+                if sell_price > 0 and not math.isclose(
+                    sell_price,
+                    round(sell_price),
+                    abs_tol=1e-9,
+                ):
+                    blocked_at = self.whole_dollar_sell_blocked_times.get(con_id)
+
+                    if blocked_at is None:
+                        self.whole_dollar_sell_blocked_times[con_id] = time.monotonic()
+                        print(
+                            f"Whole-dollar SELL-price restriction triggered: "
+                            f"{symbol} SELL order {order_id} price=${sell_price:.0f}. "
+                            f"Cancelling this order. Non-whole-dollar SELL prices "
+                            f"will be allowed after 10 minutes."
+                        )
+                        self.request_cancel(order_id)
+                        return
+
+                    elapsed = time.monotonic() - blocked_at
+
+                    if elapsed < WHOLE_DOLLAR_SELL_COOLDOWN_SECONDS:
+                        remaining = max(
+                            0,
+                            int(WHOLE_DOLLAR_SELL_COOLDOWN_SECONDS - elapsed),
+                        )
+                        minutes = remaining // 60
+                        seconds = remaining % 60
+
+                        print(
+                            f"Whole-dollar SELL-price cooldown active: "
+                            f"{symbol} SELL order {order_id} price=${sell_price:.2f}. "
+                            f"Cancelling order. Wait {minutes}m {seconds}s."
+                        )
+                        self.request_cancel(order_id)
+                        return
 
             # If this symbol already has a position AND another active order
             # on the SAME side as this new order, apply the existing-order restriction.
@@ -675,7 +793,7 @@ class OrderBlocker(EWrapper, EClient):
                         f"{symbol} already has a position and another active {action} order. "
                         f"Cancelling order {order_id}; additional same-side orders are blocked from "
                         f"{EXISTING_ORDER_BLOCK_START.strftime('%H:%M')} to "
-                        f"{EXISTING_ORDER_BLOCK_END.strftime('%H:%M')} Toronto time."
+                        f"{EXISTING_ORDER_BLOCK_END.strftime('%H:%M')}."
                     )
                     self.request_cancel(order_id)
                     return
@@ -846,7 +964,7 @@ class OrderBlocker(EWrapper, EClient):
             and details.get("action") == "BUY"
             and BUY_CANCEL_BLOCK_START <= now.time() < BUY_CANCEL_BLOCK_END
         ):
-            show_buy_cancel_popup(details.get("symbol", ""))
+            show_buy_cancel_popup()
 
         if normalized_status == "filled" and remaining_quantity <= 1e-9:
             details = self.order_details.get(order_id)
@@ -867,13 +985,13 @@ class OrderBlocker(EWrapper, EClient):
                 self.last_completed_order_times[rule_key] = time.monotonic()
                 details["completedRecorded"] = True
 
-                if security_type == "STK" and action in {"BUY", "SELL"}:
+                if security_type in {"STK", "OPT"} and action in {"BUY", "SELL"}:
                     self.record_hourly_completed_fill(con_id, symbol, action)
 
                 print(
                     f"Cooldown started: {symbol} {action} order "
                     f"{order_id} was fully filled. "
-                    "The same ticker and side are blocked for 10 minutes."
+                    "The same-side orders are blocked for 10 minutes."
                 )
 
         if normalized_status in {
@@ -892,14 +1010,19 @@ class OrderBlocker(EWrapper, EClient):
             return
 
         symbol = details["symbol"]
+        con_id = details["conId"]
         position_value = float(value)
         unrealized = float(unrealized_pnl)
+
+        if math.isfinite(position_value) and abs(position_value) < 1e100:
+            self.position_values[con_id] = position_value
+
+        if math.isfinite(unrealized) and abs(unrealized) < 1e100:
+            self.unrealized_pnls[con_id] = unrealized
 
         if abs(float(pos)) <= 1e-9:
             return
 
-        # IBKR can return ~1.7976931348623157e308 when P&L/value is unavailable.
-        # Ignore those sentinel/invalid values, and ignore zero-value placeholder positions.
         if not math.isfinite(position_value) or not math.isfinite(unrealized):
             return
 
@@ -963,9 +1086,9 @@ class OrderBlocker(EWrapper, EClient):
 def confirm_exit(signum, frame):
     print()
     print("Ctrl+C detected.")
-    confirmation = input('Type "REMEMBER DRAM TRADE WITH 9EMA" to stop the order blocker: ')
+    confirmation = input('Type "DO NOT TRADE WITH EMOTIONS" to stop the order blocker: ')
 
-    if confirmation.strip() == "REMEMBER DRAM TRADE WITH 9EMA":
+    if confirmation.strip() == "DO NOT TRADE WITH EMOTIONS":
         raise KeyboardInterrupt
 
     print("Incorrect phrase. Order blocker will continue running.")
@@ -1001,36 +1124,44 @@ def main():
         app.disconnect()
         return
 
+    stop_buy_reminder_thread = Thread(
+        target=app.stop_buy_reminder_loop,
+        daemon=True,
+    )
+    stop_buy_reminder_thread.start()
+
     print()
     print("Order blocker is running.")
     print(
-        f"Market-open direction lock: {POSITION_SIDE.upper()} "
-        f"(SHORT blocks BUY; LONG blocks SELL) "
-    )
-    print(
-        f"Overnight stock trading limit: maximum {MAX_OVERNIGHT_BUYS} BUY and {MAX_OVERNIGHT_SELLS} SELL "
-        "from 8:00 PM to 4:00 AM Toronto time."
-    )
-    print(
-        f"Maximum projected stock position value: "
+        f"Maximum single position value: "
         f"${MAX_POSITION_VALUE:.0f}."
     )
     print(
-        f"If a stock has a position and an active order, new orders are blocked from "
+        f"Tuesday SELL orders are blocked from "
+        f"{TUESDAY_SELL_BLOCK_START.strftime('%H:%M')} to {TUESDAY_SELL_BLOCK_END.strftime('%H:%M')}."
+    )
+    print(
+        f"New BUY/SELL orders are blocked from "
+        f"{MARKET_OPEN_ORDER_BLOCK_START.strftime('%H:%M')} to "
+        f"{MARKET_OPEN_ORDER_BLOCK_END.strftime('%H:%M')}, "
+        "except stop-loss orders."
+    )
+    print(
+        f"If an existing position has an active order, new orders are blocked from "
         f"{EXISTING_ORDER_BLOCK_START.strftime('%H:%M')} to "
         f"{EXISTING_ORDER_BLOCK_END.strftime('%H:%M')} "
         f"or above ${MAX_NEW_ORDER_VALUE_WITH_EXISTING_ORDER:.0f}."
     )
     print(
-        f"Tuesday stock SELL orders are blocked from "
-        f"{TUESDAY_SELL_BLOCK_START.strftime('%H:%M')} to 09:59 Toronto time."
+        f"While holding a winning long position, non-whole-dollar SELL orders after "
+        f"{WHOLE_DOLLAR_SELL_PRICE_START.strftime('%H:%M')} "
+        f"are blocked for 10 minutes."
     )
     print(
-        "After an order is fully filled, another order for the "
-        "same ticker and same side is blocked for 10 minutes."
+        "After an order is filled, same-side orders for the same ticker are blocked for 10 minutes."
     )
     print(
-        f"Maximum completed fills per ticker in 60-minute window: "
+        f"Maximum completed fills per stock/option in 60-minute window: "
         f"{MAX_BUY_FILLS_PER_HOUR} BUY fills and "
         f"{MAX_SELL_FILLS_PER_HOUR} SELL fills."
     )
